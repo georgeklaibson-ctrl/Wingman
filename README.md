@@ -1,11 +1,11 @@
 # Wingman
 
-My private dating wingman. Installable on Android (Add to Home screen) and works on the web.
+My private dating wingman, chat style. Installable on Android (Chrome > Add to Home screen) and works on the web.
 
-- **Chat helper**: paste a chat, get 2 replies in my voice, her interest level, and red flags.
-- **People**: notes on each person I'm talking to.
-- **Openers**: openers and date ideas from her bio.
-- **My voice**: my real texts and facts so it sounds like me.
-- **Training**: 👍 / 👎 and "What I'd say" on every reply. It uses these as examples next time.
+- **Chat**: talk to your wingman like a friend. Send screenshots of conversations, ask for replies, openers, date ideas. Ask it to make an image.
+- **About me**: everything it knows about you. It also saves new facts you tell it in chat.
+- **Wingman**: its name, personality and how it talks.
+- **People**: notes on each person you're talking to.
+- **Training**: 👍 / 👎 and "Say it like me" under every reply.
 
-Data is stored only on the device (localStorage). AI uses my own Google Gemini API key (free at aistudio.google.com), entered in Settings.
+Data stays only on the device. Text AI uses your own free Google Gemini key (aistudio.google.com). Images use Pollinations (free).
