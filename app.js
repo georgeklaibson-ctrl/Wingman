@@ -86,12 +86,8 @@ async function unlock() {
     }
     cryptoKey = key; db = Object.assign(blank(), data);
     $('#lock').style.display = 'none'; document.body.classList.remove('locked');
-    document.addEventListener('visibilitychange', () => {
-  if (document.hidden) hiddenAt = Date.now();
-  else if (cryptoKey && hiddenAt && Date.now() - hiddenAt > 5 * 60 * 1000) showLock();
-});
-document.addEventListener('keydown', e => { if (e.target.id === 'lockpw' && e.key === 'Enter') unlock(); });
-if (localStorage.getItem(LOCK)) showLock(); else render(db.settings.apiKey ? 'chat' : 'settings');
+    hiddenAt = 0;
+    render(db.settings.apiKey ? 'chat' : 'settings');
   } catch (err) {
     if (!window.crypto?.subtle) toast('This browser blocks encryption. Open Wingman in Chrome.');
     else toast('Wrong password. Tap the eye to check what you typed.');
