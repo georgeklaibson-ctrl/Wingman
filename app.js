@@ -1,9 +1,11 @@
 // Wingman v2: private chat-style dating wingman. Data stays on this device (localStorage).
 const KEY = 'wingman-data-v2';
 const MODELS = ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-3.1-flash-lite'];
+const OR_DEFAULT = 'deepseek/deepseek-v4.1-flash';
+const hasKey = () => (db.settings.provider === 'openrouter' ? db.settings.orKey : db.settings.apiKey);
 const TONES = ['Calm and wise', 'Playful and funny', 'Hype man', 'Straight talker', 'Romantic', 'Big brother'];
 const blank = () => ({
-  settings: { apiKey: '', model: MODELS[0] },
+  settings: { apiKey: '', model: MODELS[0], provider: 'gemini', orKey: '', orModel: OR_DEFAULT },
   me: { about: '', values: '', examples: '' },
   memories: [],
   wingman: { name: 'Wingman', tones: ['Calm and wise', 'Playful and funny'], style: '', language: 'English' },
@@ -17,7 +19,7 @@ let pendingImg = null;
 function load() {
   try {
     const v2 = JSON.parse(localStorage.getItem(KEY));
-    if (v2) return Object.assign(blank(), v2);
+    if (v2) { const d = Object.assign(blank(), v2); d.settings = Object.assign(blank().settings, v2.settings || {}); return d; }
     const v1 = JSON.parse(localStorage.getItem('wingman-data-v1'));
     const d = blank();
     if (v1) { // migrate v1
@@ -84,10 +86,10 @@ async function unlock() {
       const k2 = await deriveKey(raw, unb64(salt));
       data = JSON.parse(await decrypt(k2, localStorage.getItem(ENC)));
     }
-    cryptoKey = key; db = Object.assign(blank(), data);
+    cryptoKey = key; db = Object.assign(blank(), data); db.settings = Object.assign(blank().settings, data.settings || {});
     $('#lock').style.display = 'none'; document.body.classList.remove('locked');
     hiddenAt = 0;
-    render(db.settings.apiKey ? 'chat' : 'settings');
+    render(hasKey() ? 'chat' : 'settings');
   } catch (err) {
     if (!window.crypto?.subtle) toast('This browser blocks encryption. Open Wingman in Chrome.');
     else toast('Wrong password. Tap the eye to check what you typed.');
@@ -143,7 +145,30 @@ async function callGemini(model, body) {
   return { ok: r.ok, status: r.status, j };
 }
 
+async function thinkOpenRouter(c) {
+  const messages = [{ role: 'system', content: systemPrompt() + '\n\nAnswer ONLY with a JSON object: {"reply": string, "image_prompt": string (empty if no image needed), "remember": [short facts about George worth saving]}.' }];
+  c.msgs.slice(-24).forEach(m => {
+    const role = m.role === 'user' ? 'user' : 'assistant';
+    if (m.img?.data && m.role === 'user') messages.push({ role, content: [{ type: 'text', text: m.text || '(image)' }, { type: 'image_url', image_url: { url: `data:${m.img.mime};base64,${m.img.data}` } }] });
+    else messages.push({ role, content: m.text || '(image)' });
+  });
+  const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${db.settings.orKey}`, 'X-Title': 'Wingman' },
+    body: JSON.stringify({ model: db.settings.orModel || OR_DEFAULT, messages, temperature: 0.9, response_format: { type: 'json_object' } })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    if (r.status === 402) throw new Error('OpenRouter needs credit on your account (openrouter.ai → Credits)');
+    throw new Error(j.error?.message || 'Could not reach OpenRouter');
+  }
+  let txt = j.choices?.[0]?.message?.content || '';
+  txt = txt.replace(/^```(?:json)?\s*|\s*```$/g, '').trim();
+  try { return JSON.parse(txt); } catch { return { reply: txt || 'Hmm, I got nothing. Try again?' }; }
+}
+
 async function think(c) {
+  if (db.settings.provider === 'openrouter') return thinkOpenRouter(c);
   const contents = c.msgs.slice(-24).map(m => {
     const parts = [{ text: m.text || '(image)' }];
     if (m.img?.data && m.role === 'user') parts.unshift({ inline_data: { mime_type: m.img.mime, data: m.img.data } });
@@ -229,10 +254,15 @@ const views = {
   settings() {
     const s = db.settings;
     return `<h2>Settings</h2><div class="card">
+      <label>AI provider</label><select id="s-prov"><option value="gemini" ${s.provider !== 'openrouter' ? 'selected' : ''}>Google Gemini (free)</option><option value="openrouter" ${s.provider === 'openrouter' ? 'selected' : ''}>OpenRouter (DeepSeek and others)</option></select>
+      <p class="muted">Gemini's free tier may use chats to improve Google's products. OpenRouter needs a little credit for DeepSeek.</p>
       <label>Gemini API key</label><input id="s-key" type="password" value="${esc(s.apiKey)}" placeholder="Paste key from aistudio.google.com">
       <p class="muted">Free at aistudio.google.com → Get API key. Stays on this device only.</p>
       <label>Model</label><select id="s-model">${MODELS.map(m => `<option ${m === s.model ? 'selected' : ''}>${m}</option>`).join('')}</select>
       <p class="muted">If one model doesn't work, the app tries the others automatically.</p>
+      <label>OpenRouter API key</label><input id="s-orkey" type="password" value="${esc(s.orKey || '')}" placeholder="Paste key from openrouter.ai/keys">
+      <label>OpenRouter model</label><input id="s-ormodel" value="${esc(s.orModel || OR_DEFAULT)}" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <p class="muted">Default is DeepSeek V4.1 Flash, which reads screenshots too.</p>
       <button class="btn" id="ssave">Save</button></div>
       <div class="card"><b>Password lock</b>
       <p class="muted">${localStorage.getItem(LOCK) ? 'On. Your data is encrypted and the app asks for your password every time it opens, or after 5 minutes away.' : 'Off. Set a password so only you can open Wingman. Your data gets encrypted with it.'}</p>
@@ -270,7 +300,7 @@ function scrollDown() { const m = $('#msgs'); if (m) m.scrollTop = m.scrollHeigh
 function autosize() { const t = $('#input'); if (!t) return; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 140) + 'px'; }
 
 async function send(text) {
-  if (!db.settings.apiKey) { toast('Add your free Gemini key first'); return render('settings'); }
+  if (!hasKey()) { toast('Add your AI key in Settings first'); return render('settings'); }
   text = (text || '').trim();
   if (!text && !pendingImg) return;
   const c = chat();
@@ -349,9 +379,9 @@ document.addEventListener('click', e => {
     ['name', 'met', 'likes', 'notes', 'flags', 'next'].forEach(k => p[k] = get(k)); save(); toast('Saved'); return render('people');
   }
   if (t.id === 'pdel' && confirm('Delete this person?')) { db.people = db.people.filter(x => x.id !== t.dataset.id); save(); return render('people'); }
-  if (t.id === 'ssave') { db.settings = { apiKey: $('#s-key').value.trim(), model: $('#s-model').value }; save(); toast('Saved'); return render('chat'); }
+  if (t.id === 'ssave') { db.settings = { apiKey: $('#s-key').value.trim(), model: $('#s-model').value, provider: $('#s-prov').value, orKey: $('#s-orkey').value.trim(), orModel: $('#s-ormodel').value.trim() || OR_DEFAULT }; save(); toast('Saved'); return render('chat'); }
   if (t.id === 'exp') {
-    const copy = structuredClone(db); copy.settings.apiKey = '';
+    const copy = structuredClone(db); copy.settings.apiKey = ''; copy.settings.orKey = '';
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' }));
     a.download = 'wingman-backup.json'; a.click(); return;
   }
@@ -391,4 +421,4 @@ document.addEventListener('visibilitychange', () => {
   else if (cryptoKey && hiddenAt && Date.now() - hiddenAt > 5 * 60 * 1000) showLock();
 });
 document.addEventListener('keydown', e => { if (e.target.id === 'lockpw' && e.key === 'Enter') unlock(); });
-if (localStorage.getItem(LOCK)) showLock(); else render(db.settings.apiKey ? 'chat' : 'settings');
+if (localStorage.getItem(LOCK)) showLock(); else render(hasKey() ? 'chat' : 'settings');
