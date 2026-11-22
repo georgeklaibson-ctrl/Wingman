@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#0d0f14">
+<title>Wingman</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css?v=5">
+</head>
+<body>
+<header class="top">
+  <button class="iconbtn" id="menu" aria-label="Chats">☰</button>
+  <div class="brand" id="brandname">WINGMAN</div>
+  <button class="iconbtn" id="newchat" aria-label="New chat">＋</button>
+</header>
+
+<aside id="drawer" class="drawer"><div class="drawer-in"><h3>Your chats</h3><div id="chatlist"></div><button class="btn" id="newchat2">New chat</button></div></aside>
+
+<main id="view"></main>
+
+<nav class="tabs">
+  <button data-tab="chat" class="active">Chat</button>
+  <button data-tab="me">About me</button>
+  <button data-tab="wingman">Wingman</button>
+  <button data-tab="people">People</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+
+<div id="lock" class="lock"><div class="lockbox">
+  <div class="brand">WINGMAN</div><p class="muted">Enter your password</p>
+  <div style="display:flex;gap:8px"><input id="lockpw" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="Password"><button class="attach" id="lockeye" aria-label="Show password">👁</button></div>
+  <button class="btn" id="unlockbtn">Unlock</button>
+  <button class="btn ghost" id="forgot">Forgot password</button>
+</div></div>
+<div id="toast"></div>
+<script src="app.js?v=5"></script>
+</body>
+</html>
