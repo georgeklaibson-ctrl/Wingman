@@ -1,4 +1,4 @@
-// Wingman v2: private chat-style dating wingman. Data stays on this device (localStorage).
+// Wingman v3: private chat-style dating wingman. Data stays on this device (IndexedDB), with optional encrypted sync through a secret GitHub Gist.
 const KEY = 'wingman-data-v2';
 const MODELS = ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-3.1-flash-lite'];
 const OR_DEFAULT = 'deepseek/deepseek-v4.1-flash';
@@ -9,18 +9,46 @@ const blank = () => ({
   me: { about: '', values: '', examples: '' },
   memories: [],
   wingman: { name: 'Wingman', tones: ['Calm and wise', 'Playful and funny'], style: '', language: 'English' },
-  people: [], training: [], chats: [], current: null
+  people: [], training: [], chats: [], current: null, deleted: [], stamps: {}
 });
 const LOCK = 'wingman-lock', ENC = 'wingman-data-enc';
-let db = localStorage.getItem(LOCK) ? blank() : load();
+let db = blank();
 let cryptoKey = null, hiddenAt = 0;
 let pendingImg = null;
 
-function load() {
+// ---------- Storage: IndexedDB (much bigger than localStorage), moves old data over ----------
+const idb = (() => {
+  let p;
+  const open = () => p || (p = new Promise((res, rej) => { const r = indexedDB.open('wingman', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }));
+  const tx = (mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction('kv', mode); const q = fn(t.objectStore('kv')); t.oncomplete = () => res(q.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error); }));
+  return { get: k => tx('readonly', st => st.get(k)), set: (k, v) => tx('readwrite', st => st.put(v, k)), del: k => tx('readwrite', st => st.delete(k)) };
+})();
+const hasIdb = () => { try { return !!window.indexedDB; } catch { return false; } };
+async function getItem(k) {
+  if (hasIdb()) {
+    try {
+      const v = await idb.get(k);
+      if (v !== undefined && v !== null) return v;
+      const old = localStorage.getItem(k);
+      if (old !== null) { await idb.set(k, old); localStorage.removeItem(k); }
+      return old;
+    } catch {}
+  }
+  return localStorage.getItem(k);
+}
+async function setItem(k, v) {
+  if (hasIdb()) { try { await idb.set(k, v); localStorage.removeItem(k); return; } catch {} }
+  localStorage.setItem(k, v);
+}
+async function removeItem(k) { localStorage.removeItem(k); if (hasIdb()) { try { await idb.del(k); } catch {} } }
+async function wipeAll() { for (const k of [KEY, 'wingman-data-v1', ENC]) await removeItem(k); localStorage.removeItem(LOCK); }
+function fixup(d) { const b = blank(); const x = Object.assign(b, d || {}); x.settings = Object.assign(blank().settings, (d && d.settings) || {}); x.stamps = x.stamps || {}; x.deleted = x.deleted || []; return x; }
+
+async function load() {
   try {
-    const v2 = JSON.parse(localStorage.getItem(KEY));
-    if (v2) { const d = Object.assign(blank(), v2); d.settings = Object.assign(blank().settings, v2.settings || {}); return d; }
-    const v1 = JSON.parse(localStorage.getItem('wingman-data-v1'));
+    const v2 = JSON.parse(await getItem(KEY));
+    if (v2) return fixup(v2);
+    const v1 = JSON.parse(await getItem('wingman-data-v1'));
     const d = blank();
     if (v1) { // migrate v1
       d.settings.apiKey = v1.settings?.apiKey || '';
@@ -30,11 +58,143 @@ function load() {
     return d;
   } catch { return blank(); }
 }
-function save() {
+let saving = Promise.resolve();
+function save(noSync) {
+  const snap = JSON.stringify(db), key = cryptoKey;
+  saving = saving.then(async () => {
+    try {
+      if (key) await setItem(ENC, await encrypt(snap, key));
+      else await setItem(KEY, snap);
+    } catch { toast('Could not save. Phone storage may be full.'); }
+  });
+  if (!noSync) syncSoon();
+  return saving;
+}
+
+
+// ---------- Sync between devices: encrypted file in a secret GitHub Gist ----------
+// GitHub only ever sees scrambled data. Text syncs; screenshots stay on the device they were sent from.
+const GIST_FILE = 'wingman-sync.json';
+let syncTimer = null, syncing = false;
+const syncOn = () => !!(db.settings.sync?.token && db.settings.sync?.gistId && cryptoKey);
+function syncSoon() { if (!syncOn()) return; clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, 4000); }
+async function gh(path, opts = {}) {
+  const r = await fetch('https://api.github.com' + path, Object.assign({}, opts, { headers: { 'Accept': 'application/vnd.github+json', 'Authorization': `Bearer ${db.settings.sync.token}`, 'Content-Type': 'application/json' } }));
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) throw new Error('GitHub token is wrong or expired');
+  if (r.status === 404) throw new Error('Sync code not found (or token lacks gist access)');
+  if (!r.ok) throw new Error(j.message || 'GitHub error ' + r.status);
+  return j;
+}
+function syncPayload() {
+  const c = structuredClone(db);
+  delete c.settings; delete c.current;
+  c.chats.forEach(ch => ch.msgs.forEach(m => { if (m.img) m.img = { mime: m.img.mime }; }));
+  return c;
+}
+async function readGist(id) {
+  const g = await gh('/gists/' + encodeURIComponent(id));
+  const f = g.files?.[GIST_FILE];
+  if (!f) throw new Error('That sync code is not a Wingman sync file');
+  if (!f.truncated) return JSON.parse(f.content);
+  const r = await fetch(f.raw_url); return JSON.parse(await r.text());
+}
+const newer = (a, b) => ((b.at || 0) > (a.at || 0) ? b : a);
+function mergeList(a = [], b = [], idOf, pick) {
+  const m = new Map(a.map(x => [idOf(x), x]));
+  b.forEach(x => { const k = idOf(x); m.set(k, m.has(k) ? pick(m.get(k), x) : x); });
+  return [...m.values()];
+}
+function mergeInto(r) {
+  const dead = new Set([...(db.deleted || []), ...(r.deleted || [])]);
+  db.deleted = [...dead].slice(-500);
+  const alive = x => !dead.has(x.id);
+  db.chats = mergeList(db.chats, r.chats, x => x.id, (a, b) => {
+    const w = newer(a, b); if (w === a) return a;
+    // keep screenshots we still have on this device
+    b.msgs.forEach((m, i) => { const l = a.msgs[i]; if (m.img && l?.img?.data && l.text === m.text) m.img = l.img; });
+    return b;
+  }).filter(alive).sort((x, y) => (y.at || 0) - (x.at || 0));
+  db.people = mergeList(db.people, r.people, x => x.id, newer).filter(alive);
+  db.memories = mergeList(db.memories, r.memories, x => x.id, a => a).filter(alive);
+  db.training = mergeList(db.training, r.training, x => x.mid, newer);
+  const st = db.stamps || {}, rs = r.stamps || {};
+  if ((rs.me || 0) > (st.me || 0)) { db.me = r.me; st.me = rs.me; }
+  if ((rs.wingman || 0) > (st.wingman || 0)) { db.wingman = r.wingman; st.wingman = rs.wingman; }
+  db.stamps = st;
+  if (!db.chats.some(c => c.id === db.current)) db.current = db.chats[0]?.id || null;
+}
+async function pushGist() {
+  const { salt } = JSON.parse(localStorage.getItem(LOCK));
+  const blob = JSON.parse(await encrypt(JSON.stringify(syncPayload())));
+  const content = JSON.stringify({ app: 'wingman', v: 1, salt, iv: blob.iv, ct: blob.ct });
+  await gh('/gists/' + encodeURIComponent(db.settings.sync.gistId), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_FILE]: { content } } }) });
+}
+async function syncNow(quiet = true) {
+  if (!syncOn() || syncing) return;
+  syncing = true;
   try {
-    if (cryptoKey) { encrypt(JSON.stringify(db)).then(v => localStorage.setItem(ENC, v)).catch(() => toast('Could not save')); }
-    else localStorage.setItem(KEY, JSON.stringify(db));
-  } catch { toast('Storage full: delete old chats'); }
+    const remote = await readGist(db.settings.sync.gistId);
+    if (remote.ct) {
+      let data;
+      try { data = JSON.parse(await decrypt(cryptoKey, JSON.stringify({ iv: remote.iv, ct: remote.ct }))); }
+      catch { throw new Error('Sync password differs on another device. Connect again in Settings.'); }
+      mergeInto(data);
+    }
+    await pushGist();
+    db.settings.sync.at = Date.now();
+    await save(true);
+    const typing = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+    if (!typing && !document.body.classList.contains('locked')) {
+      if ($('#synccard')) render('settings');
+      else if ($('#view').classList.contains('chatmode') && !$('#typing') && !$('#input')?.value && !pendingImg) render('chat');
+    }
+    if (!quiet) toast('Synced');
+  } catch (e) { if (!quiet || navigator.onLine) toast('Sync: ' + e.message); }
+  syncing = false;
+}
+async function startSync(token) {
+  if (!cryptoKey) throw new Error('Turn on the password first');
+  db.settings.sync = { token, gistId: '' };
+  const { salt } = JSON.parse(localStorage.getItem(LOCK));
+  const blob = JSON.parse(await encrypt(JSON.stringify(syncPayload())));
+  const g = await gh('/gists', { method: 'POST', body: JSON.stringify({ description: 'Wingman sync (encrypted)', public: false, files: { [GIST_FILE]: { content: JSON.stringify({ app: 'wingman', v: 1, salt, iv: blob.iv, ct: blob.ct }) } } }) });
+  db.settings.sync = { token, gistId: g.id, at: Date.now() };
+  await save(true);
+}
+async function connectSync(token, code, pw) {
+  db.settings.sync = { token, gistId: code };
+  let remote;
+  try { remote = await readGist(code); } catch (e) { db.settings.sync = {}; throw e; }
+  if (!remote.salt) { db.settings.sync = {}; throw new Error('That sync code is not a Wingman sync file'); }
+  const key = await deriveKey(pw, unb64(remote.salt));
+  let data;
+  try { data = JSON.parse(await decrypt(key, JSON.stringify({ iv: remote.iv, ct: remote.ct }))); }
+  catch { db.settings.sync = {}; throw new Error("Wrong password: use the same Wingman password as your other device"); }
+  // this device now uses the same password as the other one
+  await saving;
+  cryptoKey = key;
+  localStorage.setItem(LOCK, JSON.stringify({ salt: remote.salt }));
+  mergeInto(data);
+  db.settings.sync = { token, gistId: code, at: Date.now() };
+  await save(true);
+  await removeItem(KEY); await removeItem('wingman-data-v1');
+  await pushGist();
+}
+
+// ---------- Screenshots: shrink before saving/sending ----------
+function shrinkImage(file) {
+  return new Promise(res => {
+    const url = URL.createObjectURL(file), im = new Image();
+    im.onload = () => {
+      const max = 1400, k = Math.min(1, max / Math.max(im.width, im.height));
+      const cv = document.createElement('canvas'); cv.width = Math.round(im.width * k); cv.height = Math.round(im.height * k);
+      cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height); URL.revokeObjectURL(url);
+      res({ mime: 'image/jpeg', data: cv.toDataURL('image/jpeg', 0.8).split(',')[1] });
+    };
+    im.onerror = () => { URL.revokeObjectURL(url); const r = new FileReader(); r.onload = () => res({ mime: file.type || 'image/jpeg', data: String(r.result).split(',')[1] }); r.readAsDataURL(file); };
+    im.src = url;
+  });
 }
 
 // ---------- Password lock (AES-GCM, key from password via PBKDF2) ----------
@@ -44,9 +204,9 @@ async function deriveKey(pw, salt) {
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 250000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
-async function encrypt(text) {
+async function encrypt(text, key = cryptoKey) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(text));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text));
   return JSON.stringify({ iv: b64(iv), ct: b64(ct) });
 }
 async function decrypt(key, blob) {
@@ -58,14 +218,16 @@ async function setPassword(pw) {
   pw = pw.trim();
   const salt = crypto.getRandomValues(new Uint8Array(16));
   cryptoKey = await deriveKey(pw, salt);
-  localStorage.setItem(ENC, await encrypt(JSON.stringify(db)));
+  await saving;
+  await setItem(ENC, await encrypt(JSON.stringify(db)));
   localStorage.setItem(LOCK, JSON.stringify({ salt: b64(salt) }));
   // verify the password really opens the saved data before removing the plain copy
   const check = await deriveKey(pw, unb64(JSON.parse(localStorage.getItem(LOCK)).salt));
-  JSON.parse(await decrypt(check, localStorage.getItem(ENC)));
-  localStorage.removeItem(KEY); localStorage.removeItem('wingman-data-v1');
+  JSON.parse(await decrypt(check, await getItem(ENC)));
+  await removeItem(KEY); await removeItem('wingman-data-v1');
+  if (db.settings.sync?.gistId) { db.settings.sync.gistId = ''; await save(true); toast('Password changed: turn sync on again'); }
 }
-function removePassword() { cryptoKey = null; localStorage.removeItem(LOCK); localStorage.removeItem(ENC); localStorage.setItem(KEY, JSON.stringify(db)); }
+async function removePassword() { await saving; cryptoKey = null; localStorage.removeItem(LOCK); await removeItem(ENC); await setItem(KEY, JSON.stringify(db)); }
 function showLock() {
   db = blank(); cryptoKey = null;
   document.body.classList.add('locked');
@@ -78,18 +240,20 @@ async function unlock() {
     const { salt } = JSON.parse(localStorage.getItem(LOCK));
     const key = await deriveKey(pw, unb64(salt));
     let data;
-    try { data = JSON.parse(await decrypt(key, localStorage.getItem(ENC))); }
+    const stored = await getItem(ENC);
+    try { data = JSON.parse(await decrypt(key, stored)); }
     catch (err) {
       // fallback: older build didn't trim spaces
       const raw = $('#lockpw').value;
       if (raw === pw) throw err;
       const k2 = await deriveKey(raw, unb64(salt));
-      data = JSON.parse(await decrypt(k2, localStorage.getItem(ENC)));
+      data = JSON.parse(await decrypt(k2, stored));
     }
-    cryptoKey = key; db = Object.assign(blank(), data); db.settings = Object.assign(blank().settings, data.settings || {});
+    cryptoKey = key; db = fixup(data);
     $('#lock').style.display = 'none'; document.body.classList.remove('locked');
     hiddenAt = 0;
     render(hasKey() ? 'chat' : 'settings');
+    syncNow();
   } catch (err) {
     if (!window.crypto?.subtle) toast('This browser blocks encryption. Open Wingman in Chrome.');
     else toast('Wrong password. Tap the eye to check what you typed.');
@@ -272,6 +436,19 @@ const views = {
       <p class="muted">There's no reset. If you forget it, the only way back in is to erase everything.</p>
       <button class="btn" id="setpw">${localStorage.getItem(LOCK) ? 'Change password' : 'Turn on password'}</button>
       ${localStorage.getItem(LOCK) ? '<button class="btn ghost" id="lockno">Lock now</button><button class="btn ghost" id="rmpw">Turn off password</button>' : ''}</div>
+      <div class="card" id="synccard"><b>Sync between phone and computer</b>
+      ${db.settings.sync?.gistId && cryptoKey ? `<p class="muted">On. Last synced ${db.settings.sync.at ? new Date(db.settings.sync.at).toLocaleString() : 'not yet'}. Screenshots stay on the device you sent them from.</p>
+        <label>Your sync code (paste it on your other device)</label><input id="synccode" readonly value="${esc(db.settings.sync.gistId)}">
+        <button class="btn ghost" id="copycode">Copy sync code</button><button class="btn" id="syncnow">Sync now</button><button class="btn ghost" id="syncoff">Turn off sync</button>`
+      : `<p class="muted">Keeps your chats, About me, Wingman and People the same everywhere. It's saved in a secret file on your GitHub, scrambled with your Wingman password, so nobody else can read it.</p>
+        <label>GitHub token</label><input id="ghtoken" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="ghp_..." value="${esc(db.settings.sync?.token || '')}">
+        <p class="muted"><a href="https://github.com/settings/tokens/new?scopes=gist&description=Wingman%20sync" target="_blank" rel="noopener">Make a token here</a>: set Expiration to No expiration, keep only "gist" ticked, tap Generate token, copy it.</p>
+        ${localStorage.getItem(LOCK) ? '<p class="muted"><b>First device:</b></p><button class="btn" id="syncstart">Turn on sync</button>' : '<p class="muted"><b>First device:</b> turn on the password above first.</p>'}
+        <p class="muted"><b>Other device:</b> paste the sync code from your first device and your Wingman password.</p>
+        <label>Sync code</label><input id="joincode" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <label>Wingman password (same as other device)</label><input id="joinpw" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off">
+        <button class="btn ghost" id="syncjoin">Connect this device</button>`}
+      </div>
       <div class="card"><b>Move to another device</b><p class="muted">Export here, then import on your phone or computer.</p>
       <button class="btn ghost" id="exp">Export my data</button>
       <label>Import</label><input type="file" id="imp" accept="application/json">
@@ -346,7 +523,7 @@ document.addEventListener('click', e => {
   if (t.id === 'menu') return drawer(true);
   if (t.id === 'newchat' || t.id === 'newchat2') return newChat();
   if (t.dataset.open) { db.current = t.dataset.open; save(); drawer(false); return render('chat'); }
-  if (t.dataset.delchat) { if (confirm('Delete this chat?')) { db.chats = db.chats.filter(c => c.id !== t.dataset.delchat); if (db.current === t.dataset.delchat) db.current = db.chats[0]?.id || null; save(); drawer(true); } return; }
+  if (t.dataset.delchat) { if (confirm('Delete this chat?')) { db.deleted.push(t.dataset.delchat); db.chats = db.chats.filter(c => c.id !== t.dataset.delchat); if (db.current === t.dataset.delchat) db.current = db.chats[0]?.id || null; save(); drawer(true); } return; }
   if (t.dataset.s) return send(t.dataset.s);
   if (t.id === 'send') { const v = $('#input').value; $('#input').value = ''; return send(v); }
   if (t.id === 'attach') return $('#file').click();
@@ -356,7 +533,7 @@ document.addEventListener('click', e => {
     const c = chat(); const m = c.msgs[+aiMsg.dataset.i];
     if (t.dataset.copy !== undefined) { navigator.clipboard?.writeText(m.text); return toast('Copied'); }
     if (t.dataset.rate) {
-      m.rating = t.dataset.rate;
+      m.rating = t.dataset.rate; c.at = Date.now();
       db.training = db.training.filter(x => x.mid !== c.id + aiMsg.dataset.i);
       db.training.push({ mid: c.id + aiMsg.dataset.i, text: m.text, rating: m.rating, at: Date.now() });
       save(); render('chat'); return toast(m.rating === 'up' ? 'Got it, more like this' : 'Got it, less like this');
@@ -367,27 +544,43 @@ document.addEventListener('click', e => {
       return;
     }
   }
-  if (t.dataset.delmem) { db.memories = db.memories.filter(x => x.id !== t.dataset.delmem); save(); return render('me'); }
+  if (t.dataset.delmem) { db.deleted.push(t.dataset.delmem); db.memories = db.memories.filter(x => x.id !== t.dataset.delmem); save(); return render('me'); }
   if (t.id === 'addmem') { const v = $('#newmem').value.trim(); if (v) { db.memories.push({ id: uid(), text: v }); save(); render('me'); } return; }
-  if (t.id === 'msave') { db.me = { about: $('#m-about').value, values: $('#m-values').value, examples: $('#m-examples').value }; save(); return toast('Saved'); }
+  if (t.id === 'msave') { db.me = { about: $('#m-about').value, values: $('#m-values').value, examples: $('#m-examples').value }; db.stamps.me = Date.now(); save(); return toast('Saved'); }
   if (t.dataset.tone) { const w = db.wingman; w.tones = w.tones.includes(t.dataset.tone) ? w.tones.filter(x => x !== t.dataset.tone) : [...w.tones, t.dataset.tone]; t.classList.toggle('sel'); return; }
-  if (t.id === 'wsave') { Object.assign(db.wingman, { name: $('#w-name').value.trim() || 'Wingman', style: $('#w-style').value, language: $('#w-lang').value.trim() || 'English' }); save(); render('wingman'); return toast('Saved. Your wingman sounds like this now'); }
+  if (t.id === 'wsave') { Object.assign(db.wingman, { name: $('#w-name').value.trim() || 'Wingman', style: $('#w-style').value, language: $('#w-lang').value.trim() || 'English' }); db.stamps.wingman = Date.now(); save(); render('wingman'); return toast('Saved. Your wingman sounds like this now'); }
   if (t.id === 'psave') {
     const get = k => $('#p-' + k).value.trim();
     if (!get('name')) return toast('Add a name');
     let p = db.people.find(x => x.id === t.dataset.id); if (!p) { p = { id: uid() }; db.people.push(p); }
-    ['name', 'met', 'likes', 'notes', 'flags', 'next'].forEach(k => p[k] = get(k)); save(); toast('Saved'); return render('people');
+    ['name', 'met', 'likes', 'notes', 'flags', 'next'].forEach(k => p[k] = get(k)); p.at = Date.now(); save(); toast('Saved'); return render('people');
   }
-  if (t.id === 'pdel' && confirm('Delete this person?')) { db.people = db.people.filter(x => x.id !== t.dataset.id); save(); return render('people'); }
-  if (t.id === 'ssave') { db.settings = { apiKey: $('#s-key').value.trim(), model: $('#s-model').value, provider: $('#s-prov').value, orKey: $('#s-orkey').value.trim(), orModel: $('#s-ormodel').value.trim() || OR_DEFAULT }; save(); toast('Saved'); return render('chat'); }
+  if (t.id === 'pdel' && confirm('Delete this person?')) { db.deleted.push(t.dataset.id); db.people = db.people.filter(x => x.id !== t.dataset.id); save(); return render('people'); }
+  if (t.id === 'ssave') { db.settings = { sync: db.settings.sync, apiKey: $('#s-key').value.trim(), model: $('#s-model').value, provider: $('#s-prov').value, orKey: $('#s-orkey').value.trim(), orModel: $('#s-ormodel').value.trim() || OR_DEFAULT }; save(); toast('Saved'); return render('chat'); }
   if (t.id === 'exp') {
-    const copy = structuredClone(db); copy.settings.apiKey = ''; copy.settings.orKey = '';
+    const copy = structuredClone(db); copy.settings.apiKey = ''; copy.settings.orKey = ''; copy.settings.sync = {};
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' }));
     a.download = 'wingman-backup.json'; a.click(); return;
   }
-  if (t.id === 'wipe' && confirm('Erase all your data on this device?')) { [KEY, 'wingman-data-v1', LOCK, ENC].forEach(k => localStorage.removeItem(k)); cryptoKey = null; db = blank(); render('settings'); }
+  if (t.id === 'wipe' && confirm('Erase all your data on this device?')) { cryptoKey = null; db = blank(); wipeAll().then(() => render('settings')); return; }
+  if (t.id === 'syncstart') {
+    const tok = $('#ghtoken').value.trim(); if (!tok) return toast('Paste your GitHub token first');
+    t.textContent = 'Turning on…';
+    startSync(tok).then(() => { toast('Sync is on'); render('settings'); }).catch(err => { toast('Sync: ' + err.message); render('settings'); });
+    return;
+  }
+  if (t.id === 'syncjoin') {
+    const tok = $('#ghtoken').value.trim(), code = $('#joincode').value.trim(), pw = $('#joinpw').value.trim();
+    if (!tok || !code || !pw) return toast('Fill in token, sync code and password');
+    t.textContent = 'Connecting…';
+    connectSync(tok, code, pw).then(() => { toast('Connected. Your chats are here now'); render('settings'); }).catch(err => { toast(err.message); render('settings'); });
+    return;
+  }
+  if (t.id === 'syncnow') { t.textContent = 'Syncing…'; return syncNow(false); }
+  if (t.id === 'copycode') { navigator.clipboard?.writeText(db.settings.sync.gistId); return toast('Copied'); }
+  if (t.id === 'syncoff' && confirm('Turn off sync on this device? Your data stays here.')) { db.settings.sync = {}; save(true); toast('Sync off'); return render('settings'); }
   if (t.id === 'unlockbtn') return unlock();
-  if (t.id === 'forgot' && confirm('Erase everything and start over? This cannot be undone.')) { [KEY, 'wingman-data-v1', LOCK, ENC].forEach(k => localStorage.removeItem(k)); location.reload(); }
+  if (t.id === 'forgot' && confirm('Erase everything and start over? This cannot be undone.')) { wipeAll().then(() => location.reload()); return; }
   if (t.id === 'setpw') {
     const a = $('#pw1').value.trim(), b = $('#pw2').value.trim();
     if (a.length < 4) return toast('Use at least 4 characters');
@@ -399,19 +592,18 @@ document.addEventListener('click', e => {
   if (t.id === 'lockno') return showLock();
   if (t.id === 'showpw') { ['pw1', 'pw2'].forEach(i => $('#' + i).type = t.checked ? 'text' : 'password'); return; }
   if (t.id === 'lockeye') { const i = $('#lockpw'); i.type = i.type === 'password' ? 'text' : 'password'; return; }
-  if (t.id === 'rmpw' && confirm('Turn off the password? Your data will no longer be encrypted.')) { removePassword(); toast('Password off'); return render('settings'); }
+  if (t.id === 'rmpw' && confirm('Turn off the password? Your data will no longer be encrypted, and sync stops.')) { removePassword().then(() => { toast('Password off'); render('settings'); }); return; }
 });
 
 document.addEventListener('keydown', e => { if (e.target.id === 'input' && e.key === 'Enter' && !e.shiftKey && window.matchMedia('(pointer:fine)').matches) { e.preventDefault(); $('#send').click(); } });
 document.addEventListener('input', e => { if (e.target.id === 'input') autosize(); });
 document.addEventListener('change', e => {
   if (e.target.id === 'file' && e.target.files[0]) {
-    const f = e.target.files[0]; const r = new FileReader();
-    r.onload = () => { pendingImg = { mime: f.type || 'image/jpeg', data: String(r.result).split(',')[1] }; $('#preview').textContent = '📷 Screenshot attached. Add a note or just send.'; };
-    r.readAsDataURL(f);
+    const f = e.target.files[0];
+    shrinkImage(f).then(img => { pendingImg = img; $('#preview').textContent = '📷 Screenshot attached. Add a note or just send.'; });
   }
   if (e.target.id === 'imp' && e.target.files[0]) {
-    e.target.files[0].text().then(txt => { const d = JSON.parse(txt); d.settings = db.settings; db = Object.assign(blank(), d); save(); toast('Imported'); render('chat'); }).catch(() => toast('Could not read that file'));
+    e.target.files[0].text().then(txt => { const d = JSON.parse(txt); d.settings = db.settings; db = fixup(d); save(); toast('Imported'); render('chat'); }).catch(() => toast('Could not read that file'));
   }
 });
 
@@ -419,6 +611,7 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) hiddenAt = Date.now();
   else if (cryptoKey && hiddenAt && Date.now() - hiddenAt > 5 * 60 * 1000) showLock();
+  else syncNow();
 });
 document.addEventListener('keydown', e => { if (e.target.id === 'lockpw' && e.key === 'Enter') unlock(); });
-if (localStorage.getItem(LOCK)) showLock(); else render(hasKey() ? 'chat' : 'settings');
+if (localStorage.getItem(LOCK)) showLock(); else load().then(d => { db = fixup(d); render(hasKey() ? 'chat' : 'settings'); });
