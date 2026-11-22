@@ -8,7 +8,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="styles.css?v=3">
+<link rel="stylesheet" href="styles.css?v=4">
 </head>
 <body>
 <header class="top">
@@ -31,11 +31,11 @@
 
 <div id="lock" class="lock"><div class="lockbox">
   <div class="brand">WINGMAN</div><p class="muted">Enter your password</p>
-  <input id="lockpw" type="password" autocomplete="current-password" placeholder="Password">
+  <div style="display:flex;gap:8px"><input id="lockpw" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="Password"><button class="attach" id="lockeye" aria-label="Show password">👁</button></div>
   <button class="btn" id="unlockbtn">Unlock</button>
   <button class="btn ghost" id="forgot">Forgot password</button>
 </div></div>
 <div id="toast"></div>
-<script src="app.js?v=3"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>

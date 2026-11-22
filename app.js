@@ -53,10 +53,14 @@ async function decrypt(key, blob) {
   return new TextDecoder().decode(pt);
 }
 async function setPassword(pw) {
+  pw = pw.trim();
   const salt = crypto.getRandomValues(new Uint8Array(16));
   cryptoKey = await deriveKey(pw, salt);
   localStorage.setItem(ENC, await encrypt(JSON.stringify(db)));
   localStorage.setItem(LOCK, JSON.stringify({ salt: b64(salt) }));
+  // verify the password really opens the saved data before removing the plain copy
+  const check = await deriveKey(pw, unb64(JSON.parse(localStorage.getItem(LOCK)).salt));
+  JSON.parse(await decrypt(check, localStorage.getItem(ENC)));
   localStorage.removeItem(KEY); localStorage.removeItem('wingman-data-v1');
 }
 function removePassword() { cryptoKey = null; localStorage.removeItem(LOCK); localStorage.removeItem(ENC); localStorage.setItem(KEY, JSON.stringify(db)); }
@@ -66,12 +70,20 @@ function showLock() {
   $('#lock').style.display = 'flex'; $('#lockpw').value = ''; setTimeout(() => $('#lockpw').focus(), 100);
 }
 async function unlock() {
-  const pw = $('#lockpw').value; if (!pw) return;
+  const pw = $('#lockpw').value.trim(); if (!pw) return;
   $('#unlockbtn').textContent = 'Unlocking…';
   try {
     const { salt } = JSON.parse(localStorage.getItem(LOCK));
     const key = await deriveKey(pw, unb64(salt));
-    const data = JSON.parse(await decrypt(key, localStorage.getItem(ENC)));
+    let data;
+    try { data = JSON.parse(await decrypt(key, localStorage.getItem(ENC))); }
+    catch (err) {
+      // fallback: older build didn't trim spaces
+      const raw = $('#lockpw').value;
+      if (raw === pw) throw err;
+      const k2 = await deriveKey(raw, unb64(salt));
+      data = JSON.parse(await decrypt(k2, localStorage.getItem(ENC)));
+    }
     cryptoKey = key; db = Object.assign(blank(), data);
     $('#lock').style.display = 'none'; document.body.classList.remove('locked');
     document.addEventListener('visibilitychange', () => {
@@ -80,7 +92,10 @@ async function unlock() {
 });
 document.addEventListener('keydown', e => { if (e.target.id === 'lockpw' && e.key === 'Enter') unlock(); });
 if (localStorage.getItem(LOCK)) showLock(); else render(db.settings.apiKey ? 'chat' : 'settings');
-  } catch { toast('Wrong password'); $('#lockpw').value = ''; }
+  } catch (err) {
+    if (!window.crypto?.subtle) toast('This browser blocks encryption. Open Wingman in Chrome.');
+    else toast('Wrong password. Tap the eye to check what you typed.');
+  }
   $('#unlockbtn').textContent = 'Unlock';
 }
 const $ = (s, el = document) => el.querySelector(s);
@@ -225,8 +240,9 @@ const views = {
       <button class="btn" id="ssave">Save</button></div>
       <div class="card"><b>Password lock</b>
       <p class="muted">${localStorage.getItem(LOCK) ? 'On. Your data is encrypted and the app asks for your password every time it opens, or after 5 minutes away.' : 'Off. Set a password so only you can open Wingman. Your data gets encrypted with it.'}</p>
-      <label>${localStorage.getItem(LOCK) ? 'New password' : 'Password'}</label><input id="pw1" type="password" autocomplete="new-password">
-      <label>Type it again</label><input id="pw2" type="password" autocomplete="new-password">
+      <label>${localStorage.getItem(LOCK) ? 'New password' : 'Password'}</label><input id="pw1" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off">
+      <label>Type it again</label><input id="pw2" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off">
+      <label class="muted" style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="showpw" style="width:auto"> Show password</label>
       <p class="muted">There's no reset. If you forget it, the only way back in is to erase everything.</p>
       <button class="btn" id="setpw">${localStorage.getItem(LOCK) ? 'Change password' : 'Turn on password'}</button>
       ${localStorage.getItem(LOCK) ? '<button class="btn ghost" id="lockno">Lock now</button><button class="btn ghost" id="rmpw">Turn off password</button>' : ''}</div>
@@ -347,14 +363,16 @@ document.addEventListener('click', e => {
   if (t.id === 'unlockbtn') return unlock();
   if (t.id === 'forgot' && confirm('Erase everything and start over? This cannot be undone.')) { [KEY, 'wingman-data-v1', LOCK, ENC].forEach(k => localStorage.removeItem(k)); location.reload(); }
   if (t.id === 'setpw') {
-    const a = $('#pw1').value, b = $('#pw2').value;
+    const a = $('#pw1').value.trim(), b = $('#pw2').value.trim();
     if (a.length < 4) return toast('Use at least 4 characters');
     if (a !== b) return toast("Passwords don't match");
     t.textContent = 'Saving…';
-    setPassword(a).then(() => { toast('Password is on'); render('settings'); });
+    setPassword(a).then(() => { toast('Password is on'); render('settings'); }).catch(err => { toast('Could not set password: ' + err.message); render('settings'); });
     return;
   }
   if (t.id === 'lockno') return showLock();
+  if (t.id === 'showpw') { ['pw1', 'pw2'].forEach(i => $('#' + i).type = t.checked ? 'text' : 'password'); return; }
+  if (t.id === 'lockeye') { const i = $('#lockpw'); i.type = i.type === 'password' ? 'text' : 'password'; return; }
   if (t.id === 'rmpw' && confirm('Turn off the password? Your data will no longer be encrypted.')) { removePassword(); toast('Password off'); return render('settings'); }
 });
 
