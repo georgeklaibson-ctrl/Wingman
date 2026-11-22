@@ -9,7 +9,9 @@ const blank = () => ({
   wingman: { name: 'Wingman', tones: ['Calm and wise', 'Playful and funny'], style: '', language: 'English' },
   people: [], training: [], chats: [], current: null
 });
-let db = load();
+const LOCK = 'wingman-lock', ENC = 'wingman-data-enc';
+let db = localStorage.getItem(LOCK) ? blank() : load();
+let cryptoKey = null, hiddenAt = 0;
 let pendingImg = null;
 
 function load() {
@@ -26,7 +28,61 @@ function load() {
     return d;
   } catch { return blank(); }
 }
-function save() { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch { toast('Storage full: delete old chats'); } }
+function save() {
+  try {
+    if (cryptoKey) { encrypt(JSON.stringify(db)).then(v => localStorage.setItem(ENC, v)).catch(() => toast('Could not save')); }
+    else localStorage.setItem(KEY, JSON.stringify(db));
+  } catch { toast('Storage full: delete old chats'); }
+}
+
+// ---------- Password lock (AES-GCM, key from password via PBKDF2) ----------
+const b64 = buf => { const a = new Uint8Array(buf); let s = ''; for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000)); return btoa(s); };
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+async function deriveKey(pw, salt) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 250000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function encrypt(text) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(text));
+  return JSON.stringify({ iv: b64(iv), ct: b64(ct) });
+}
+async function decrypt(key, blob) {
+  const { iv, ct } = JSON.parse(blob);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv) }, key, unb64(ct));
+  return new TextDecoder().decode(pt);
+}
+async function setPassword(pw) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  cryptoKey = await deriveKey(pw, salt);
+  localStorage.setItem(ENC, await encrypt(JSON.stringify(db)));
+  localStorage.setItem(LOCK, JSON.stringify({ salt: b64(salt) }));
+  localStorage.removeItem(KEY); localStorage.removeItem('wingman-data-v1');
+}
+function removePassword() { cryptoKey = null; localStorage.removeItem(LOCK); localStorage.removeItem(ENC); localStorage.setItem(KEY, JSON.stringify(db)); }
+function showLock() {
+  db = blank(); cryptoKey = null;
+  document.body.classList.add('locked');
+  $('#lock').style.display = 'flex'; $('#lockpw').value = ''; setTimeout(() => $('#lockpw').focus(), 100);
+}
+async function unlock() {
+  const pw = $('#lockpw').value; if (!pw) return;
+  $('#unlockbtn').textContent = 'Unlocking…';
+  try {
+    const { salt } = JSON.parse(localStorage.getItem(LOCK));
+    const key = await deriveKey(pw, unb64(salt));
+    const data = JSON.parse(await decrypt(key, localStorage.getItem(ENC)));
+    cryptoKey = key; db = Object.assign(blank(), data);
+    $('#lock').style.display = 'none'; document.body.classList.remove('locked');
+    document.addEventListener('visibilitychange', () => {
+  if (document.hidden) hiddenAt = Date.now();
+  else if (cryptoKey && hiddenAt && Date.now() - hiddenAt > 5 * 60 * 1000) showLock();
+});
+document.addEventListener('keydown', e => { if (e.target.id === 'lockpw' && e.key === 'Enter') unlock(); });
+if (localStorage.getItem(LOCK)) showLock(); else render(db.settings.apiKey ? 'chat' : 'settings');
+  } catch { toast('Wrong password'); $('#lockpw').value = ''; }
+  $('#unlockbtn').textContent = 'Unlock';
+}
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s = '') => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -167,6 +223,13 @@ const views = {
       <label>Model</label><select id="s-model">${MODELS.map(m => `<option ${m === s.model ? 'selected' : ''}>${m}</option>`).join('')}</select>
       <p class="muted">If one model doesn't work, the app tries the others automatically.</p>
       <button class="btn" id="ssave">Save</button></div>
+      <div class="card"><b>Password lock</b>
+      <p class="muted">${localStorage.getItem(LOCK) ? 'On. Your data is encrypted and the app asks for your password every time it opens, or after 5 minutes away.' : 'Off. Set a password so only you can open Wingman. Your data gets encrypted with it.'}</p>
+      <label>${localStorage.getItem(LOCK) ? 'New password' : 'Password'}</label><input id="pw1" type="password" autocomplete="new-password">
+      <label>Type it again</label><input id="pw2" type="password" autocomplete="new-password">
+      <p class="muted">There's no reset. If you forget it, the only way back in is to erase everything.</p>
+      <button class="btn" id="setpw">${localStorage.getItem(LOCK) ? 'Change password' : 'Turn on password'}</button>
+      ${localStorage.getItem(LOCK) ? '<button class="btn ghost" id="lockno">Lock now</button><button class="btn ghost" id="rmpw">Turn off password</button>' : ''}</div>
       <div class="card"><b>Move to another device</b><p class="muted">Export here, then import on your phone or computer.</p>
       <button class="btn ghost" id="exp">Export my data</button>
       <label>Import</label><input type="file" id="imp" accept="application/json">
@@ -280,7 +343,19 @@ document.addEventListener('click', e => {
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' }));
     a.download = 'wingman-backup.json'; a.click(); return;
   }
-  if (t.id === 'wipe' && confirm('Erase all your data on this device?')) { localStorage.removeItem(KEY); localStorage.removeItem('wingman-data-v1'); db = blank(); render('settings'); }
+  if (t.id === 'wipe' && confirm('Erase all your data on this device?')) { [KEY, 'wingman-data-v1', LOCK, ENC].forEach(k => localStorage.removeItem(k)); cryptoKey = null; db = blank(); render('settings'); }
+  if (t.id === 'unlockbtn') return unlock();
+  if (t.id === 'forgot' && confirm('Erase everything and start over? This cannot be undone.')) { [KEY, 'wingman-data-v1', LOCK, ENC].forEach(k => localStorage.removeItem(k)); location.reload(); }
+  if (t.id === 'setpw') {
+    const a = $('#pw1').value, b = $('#pw2').value;
+    if (a.length < 4) return toast('Use at least 4 characters');
+    if (a !== b) return toast("Passwords don't match");
+    t.textContent = 'Saving…';
+    setPassword(a).then(() => { toast('Password is on'); render('settings'); });
+    return;
+  }
+  if (t.id === 'lockno') return showLock();
+  if (t.id === 'rmpw' && confirm('Turn off the password? Your data will no longer be encrypted.')) { removePassword(); toast('Password off'); return render('settings'); }
 });
 
 document.addEventListener('keydown', e => { if (e.target.id === 'input' && e.key === 'Enter' && !e.shiftKey && window.matchMedia('(pointer:fine)').matches) { e.preventDefault(); $('#send').click(); } });
@@ -297,4 +372,9 @@ document.addEventListener('change', e => {
 });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
-render(db.settings.apiKey ? 'chat' : 'settings');
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) hiddenAt = Date.now();
+  else if (cryptoKey && hiddenAt && Date.now() - hiddenAt > 5 * 60 * 1000) showLock();
+});
+document.addEventListener('keydown', e => { if (e.target.id === 'lockpw' && e.key === 'Enter') unlock(); });
+if (localStorage.getItem(LOCK)) showLock(); else render(db.settings.apiKey ? 'chat' : 'settings');
